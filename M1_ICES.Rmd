@@ -1,9 +1,10 @@
 ---
 title: "M1_ICES_pre-script"
 author: "Anders Torstensson <anders.torstensson@smhi.se>, Swedish Meteorological and Hydrological Institute"
-date: '2021-10-20'
+date: '2021-11-25'
 params:
-  ICES_export: "example.csv" # change to the name of your ICES export file, e.g. "Phytoplankton202110221053dsssxrg15suned25y1xlnpan.csv"
+  ICES_export: "example.csv" # change to the name of your ICES export file
+  biomass: BMCCONT # choose BMCCONT for biomass (ug/l) or BMCEVOL for biovolume (um3/l) 
 output: html_document
 ---
 
@@ -13,21 +14,23 @@ This is an R Markdown document. Markdown is a simple formatting syntax for autho
 
 When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document.
 
-The script reads a phytoplankton ICES export file (https://dome.ices.dk/views/Phytoplankton.aspx) and converts it into a format compatible with the **Helcom candidate indicator script** written by Joanna Calkiewicz & Janina Kownacka according to the document 'Seasonal succession of dominating phytoplankton groups'.
+The script reads a phytoplankton ICES export file (downloaded at https://dome.ices.dk/views/Phytoplankton.aspx) and prepares data for the **Helcom candidate indicator script** written by Joanna Calkiewicz & Janina Kownacka according to the document 'Seasonal succession of dominating phytoplankton groups'. The indicator focuses on the phytoplankton groups dinoflagellates (mixotrophic and autotrophic), cyanobacteria, diatoms and the species Mesodinium rubrum.
 
-The script matches taxa names with the World register of marine species (WORMS; http://www.marinespecies.org/index.php), in order to get higher taxonomic information (e.g. class) as taxa reported before the implementation of the PEG list lack taxonomic information. The script groups taxa based on class, and aggregates biomass data (in ug/l) for diatoms, cyanobacteria, autotrophic/mixotrophic dinoflagellates and for the species Mesodinium rubrum in each sample. As of 2021, the ICES database lacks trophic type information on data published before 2008, and the script will therefore exclude any dinoflagellates reported before this year.
+The script matches taxa names with the World register of marine species (WoRMS; http://www.marinespecies.org/index.php) in order to get higher taxonomic information (i.e. class), as taxa reported to ICES before the implementation of the PEG list lack taxonomic information. The matching with WoRMS is performed step wise at four levels to classify as many taxa as possible; one exact match, one fuzzy match, one freshwater match and one final match on genus level. The taxa that could not be classified after the step wise process are printed in the end of the HTML output.
+
+The script groups taxa based on taxonomic level, and aggregates biomass data (in ug/l or um3/l, choose params above) for diatoms, cyanobacteria, autotrophic/mixotrophic dinoflagellates and for the species Mesodinium rubrum in each sample. 
+
+As of 2021, the ICES database lacks trophic type information on data published before ~2008. Pre-2008 dinoflagellate data will therefore be excluded as heterotrophic taxa cannot be discarded from the dataset.
 
 The script outputs are the following:
 
-**ICES.html** - Summary of the script output
+**M1_ICES.html** - Summary of the script output
 
-**data_all.csv** - Data file that can be read in the Helcom candidate indicator script. The first 50 rows are shown in the html output.
-
-**WORMS_fuzzy_search_results.csv** - List of all unique taxa in the dataset that could not be directly matched in WORMS, please verify the classification. A condensed list is also printed below.
-
-**WORMS_classification_results.csv** - List of all unique taxa in the dataset and the WORMS classification, including the fuzzy results
+**data_all.csv** - Data file that can be read in the Helcom candidate indicator script.
 
 **Plots** - Time series plots for the total phytoplankton biomass, and for each taxonomic group. Can be used to manually select the ref/test period in the Helcom candidate indicator script, and to identify outliers that may need manual attention before data are processed by the indicator script.
+
+**WoRMS_classification_results.txt** - List of all unique taxa in the dataset and their WoRMS classification, including the fuzzy, freshwater and genus results.  The list is printed for potential class verification purposes.
 
 ## Load necessary libraries
 
@@ -35,6 +38,38 @@ The script outputs are the following:
 library(tidyverse) # Used for data wrangling
 library(worrms) # Used to get taxonomic information
 library(knitr) # For html table reports
+library(kableExtra) # For html table reports
+```
+
+## Create coelesce function to faciliate table joins
+
+The core operation of coalesce_join will be done by dplyr::coalesce, which replaces NA values in a vector with corresponding non-missing values from another of identical length (or length 1)
+
+```{r coalesce_join, include=FALSE}
+coalesce_join <- function(x, y, 
+                          by = NULL, suffix = c(".x", ".y"), 
+                          join = dplyr::full_join, ...) {
+    joined <- join(x, y, by = by, suffix = suffix, ...)
+    # names of desired output
+    cols <- union(names(x), names(y))
+    
+    to_coalesce <- names(joined)[!names(joined) %in% cols]
+    suffix_used <- suffix[ifelse(endsWith(to_coalesce, suffix[1]), 1, 2)]
+    # remove suffixes and deduplicate
+    to_coalesce <- unique(substr(
+        to_coalesce, 
+        1, 
+        nchar(to_coalesce) - nchar(suffix_used)
+    ))
+    
+    coalesced <- purrr::map_dfc(to_coalesce, ~dplyr::coalesce(
+        joined[[paste0(.x, suffix[1])]], 
+        joined[[paste0(.x, suffix[2])]]
+    ))
+    names(coalesced) <- to_coalesce
+    
+    dplyr::bind_cols(joined, coalesced)[cols]
+}
 ```
 
 ## Read data
@@ -50,29 +85,45 @@ end_time - start_time
 
 ## Clean input data
 
+Filter out potential biomass data in the biovolume dataset and transform biomass/biovolume data to uniform scales (ug/l or um3/l)
+
 ```{r cleandata, echo = FALSE}
 data <- data %>% 
-  filter(!is.na(Year) & PARAM == "BMCCONT") # Removes junk rows (if present) and filters out all biomass data
+  filter(!is.na(Year) & PARAM == params$biomass & !is.na(final_value)) # Removes junk rows (if present) and filters out all biomass data
+
+if(levels(as.factor(data$PARAM)) == "BMCEVOL") {
+  data <- data %>%
+    filter(!MUNIT=="ug/l")
+}
+
 data$SPECI_name <- str_to_sentence(data$SPECI_name) # Transform taxa names to uniform case
+
 data$STATN[data$STATN==""] <- "missing" # Avoid NAs in station name
-data$SPECI_name <- gsub("ã«|ë","e" , data$SPECI_name ,ignore.case = TRUE) # Remove special characters that cause "408-JSON errors" in wm_name2id
-data$final_value <- ifelse(data$MUNIT %in% "pg", data$final_value/1000000, data$final_value) # Convert biomass data if reported in pg/l to ug/l
-data$final_value <- ifelse(data$MUNIT %in% "g", data$final_value*1000000, data$final_value) # Convert biomass data if reported in g/l to ug/l
+
+data$SPECI_name <- gsub("ã«|ë","e" , data$SPECI_name ,ignore.case = TRUE) # Remove special characters that cause "408-JSON errors" in wm_record
+
+data$final_value <- ifelse(data$MUNIT %in% "pg", data$final_value/10^6, data$final_value) # Convert biomass data if reported in pg/l to ug/l
+data$final_value <- ifelse(data$MUNIT %in% "mm3/l", data$final_value*10^9, data$final_value) # Convert biovolume data if reported in mm3/l to um3/l
+data$final_value <- ifelse(data$MUNIT %in% "mm3/m3", data$final_value*10^6, data$final_value) # Convert biovolume data if reported in mm3/m3 to um3/l
 ```
 
-## Plot total biomass
+## Plot total biomass time series (ug/l or um3/l)
 
 Manually check plots for outliers, data may have, for instance, been reported on the wrong measuring unit.
 
 ```{r plottotal, echo = FALSE}
+print(paste("You have selected", paste(params$biomass), "as biomass parameter", sep=" "))
+
 data_total <- aggregate(final_value ~ ï..tblSampleID+DATE+Year+Month+PARAM_desc, data, sum, na.action = na.omit)
-colnames(data_total) <- c("sampleid","date","year","month","parameter","biomass")
+
+colnames(data_total) <- c("sampleid", "date", "year", "month", "parameter", "biomass")
+
 data_total$date <- as.Date(data_total$date,"%d/%m/%Y")
 
 main_title <- paste("Total biomass (per sample),",unique(data$PARAM_desc), sep = " ")
 
 p<-ggplot() + 
-         geom_point(aes(x=date, y=log(biomass+1)),data_total,size=2) +
+         geom_point(aes(x=date, y=log(biomass+1)), data_total,size=2) +
          ggtitle(main_title) + theme(plot.title = element_text(size=10))
 p
 
@@ -89,97 +140,216 @@ Taxon <- Taxon[Taxon != ""]
 print(paste("Dataset has", length(Taxon), "unique taxa", sep=" "))
 ```
 
-## Get AphiaID from WORMS and create a lookup table
+## Get taxonomic records from WoRMS and create a lookup table
 
-wm_name2id_ has a maximum number of taxa that it can processes. A dataset that is too large can produce server errors. Taxa with 204 and 206 warnings are processed with the Fuzzy search tool later in the script.
+Taxa without a match are processed with the "fuzzy" and "freshwater" search tools later in the script. Taxa that still lack taxonomic classification are matched on genus level later in the script.
 
-```{r getaphiaid, echo = FALSE}
+```{r getrecords, echo = FALSE, warning = FALSE}
+getrecord <- data.frame()
+
 start_time = Sys.time()
-getaphiaID_tibble <- wm_name2id_(name = Taxon) %>% 
-  as_tibble()
+for (i in 1:length(Taxon)) {
+    tryCatch({
+        record <- wm_record_(name=Taxon[i])
+        getrecord <- rbind(getrecord, record[[1]])
+    }, error=function(e){})
+}
 end_time = Sys.time()
 end_time - start_time
 
-lookup <- getaphiaID_tibble %>% 
-  mutate_all(as.character) %>% 
-  gather() %>% 
-  rename(Taxon = key, aphiaID = value)
-lookup$aphiaID <- as.numeric(lookup$aphiaID)
-colnames(lookup) <- c("Taxon","id")
+Taxon.df <- as.data.frame(Taxon)
+names(Taxon.df)<-"scientificname"
+Taxon.df$name2worms <- Taxon.df$scientificname
+
+lookup <- Taxon.df %>% 
+  left_join(getrecord, by = "scientificname", na_matches = "never")
+lookup$SPECI_name <- lookup$name2worms
+
+print(paste(length(lookup$AphiaID[!is.na(lookup$AphiaID)]), "taxa were matched based on exact names", sep=" "))
 ```
 
-## Get class information for lookup table from WORMS
+## Get list of taxa that could not be correctly matched in WoRMS 
 
-Taxa with 404 warnings are are processed with the Fuzzy search tool later in the script.
+The script will instead assign classes using the WoRMS "fuzzy search tool". The first non-NA match is selected.
 
-```{r getclass, echo = FALSE, warning = FALSE}
+```{r fuzzymatch, echo = FALSE}
+missing_id <- filter(lookup,is.na(AphiaID))
+
+print(paste("Dataset has", length(missing_id$scientificname), "taxa without a direct WoRMS match, will continue with a fuzzy search for the selected taxa. See WoRMS_fuzzy_search_results.txt to verify correct matching", sep=" "))
+
+missing_id_fuzzy <- data.frame()
+
 start_time = Sys.time()
-getclass_tibble <- wm_classification_(id = lookup$id) %>% 
-  as_tibble()
+
+for (i in 1:length(missing_id$scientificname)) {
+    tryCatch({
+        missing_list <- wm_records_name(name=missing_id$scientificname[i], fuzzy=TRUE, marine_only=TRUE)
+        missing <- missing_list[1,]
+        missing$name2worms <- missing_id$scientificname[i]
+        for (i in 1:length(missing_list$scientificname)) {
+          if(is.na(missing$scientificname)) {
+            missing <- missing_list[i+1,]
+          }
+        }
+        missing_id_fuzzy <- rbind(missing_id_fuzzy, missing)
+    }, error=function(e){})
+}
+
 end_time = Sys.time()
 end_time - start_time
 
-getclass_tibble <- filter(getclass_tibble,rank=="Class")
-getclass_tibble$id <- as.numeric(getclass_tibble$id)
+missing_id_fuzzy$fuzzy <- missing_id_fuzzy$scientificname
 
-lookup <- lookup %>% left_join(getclass_tibble, by = "id")
-colnames(lookup) <- c("Taxon","id","AphiaID","rank","class")
+print(paste(length(missing_id_fuzzy$scientificname), "additional taxa were matched using the fuzzy search tool", sep=" "))
 ```
 
-## Get list of taxa that could not be correctly matched in WORMS 
+## Get second list of taxa that could not be correctly matched in WoRMS 
 
-The script will instead assign classes using the WORMS fuzzy search tool. May return internal 500 error if the server is busy. May be tweaked with marine_only=FALSE if freshwater species are common.
+The script will instead assign classes using the WoRMS "fuzzy search tool" by including freshwater taxa. The first non-NA match is selected.
 
-```{r missingid, echo = FALSE}
-missing_id <- filter(lookup,id=="-999")
-print(paste("Dataset has", nrow(missing_id), "taxa without a direct WORMS match, will continue with a fuzzy search for the selected taxa. See WORMS_fuzzy_search_results.csv to verify correct matching", sep=" "))
+```{r freshwatermatch, echo = FALSE}
+missing_id2 <- lookup %>% 
+  left_join(missing_id_fuzzy, by = "name2worms", na_matches = "never") %>% 
+  filter(is.na(AphiaID.x)) %>% 
+  filter(is.na(AphiaID.y)) %>% 
+  rename("scientificname"=scientificname.x)
+
+print(paste("Dataset still has", length(missing_id2$scientificname), "taxa without a WoRMS match, will continue with a fuzzy freshwater search for the selected taxa.", sep=" "))
+
+missing_id_fuzzy2 <- data.frame()
+
 start_time = Sys.time()
-missing_id_fuzzy <- wm_records_names(name=missing_id$Taxon,fuzzy=TRUE,marine_only=TRUE)
+
+for (i in 1:length(missing_id2$scientificname)) {
+    tryCatch({
+        missing_list2 <- wm_records_name(name=missing_id2$scientificname[i], fuzzy=TRUE, marine_only=FALSE)
+        missing_list2$name2worms <- missing_id2$scientificname[i]
+        missing2 <- missing_list2[1,]
+        for (i in 1:length(missing_list2$scientificname)) {
+          if(is.na(missing2$scientificname)) {
+            missing2 <- missing_list2[i+1,]
+          }
+        }
+        missing_id_fuzzy2 <- rbind(missing_id_fuzzy2, missing2)
+    }, error=function(e){})
+}
+
 end_time = Sys.time()
 end_time - start_time
+
+missing_id_fuzzy2 <- missing_id_fuzzy2 %>%
+  filter(!is.na(scientificname))
+
+missing_id_fuzzy2$fuzzy2 <- missing_id_fuzzy2$scientificname
+
+print(paste(length(missing_id_fuzzy2$scientificname[!is.na(missing_id_fuzzy2$scientificname)]), "additional taxa were matched using the fuzzy freshwater search tool", sep=" "))
 ```
 
-## Select the first fuzzy match of each taxa
+## Join lookup table with the fuzzy and freshwater table
 
-Convert to a data table and write a list of the matches in WORMS_fuzzy_search_results.csv. Please verify list for correct WORMS matching.
+The remaining unmatched taxa will be matched on genus level
 
-```{r selectfuzzy, echo = FALSE}
-missing_id_fuzzy <- lapply(missing_id_fuzzy, function(df){
-  df %>%
-    filter(row_number()==1)
-})
+```{r join, echo = FALSE, warning = FALSE}
+worms_all <- lookup %>%
+  coalesce_join(missing_id_fuzzy, by = "name2worms", na_matches = "never")
 
-missing_id_fuzzy <- bind_rows(missing_id_fuzzy)
-colnames(missing_id_fuzzy)[3] <- "Taxon"
-write.csv(missing_id_fuzzy, "WORMS_fuzzy_search_results.csv")
-
-missing_id_fuzzy %>%
-  select(Taxon,valid_name,valid_AphiaID,class) %>%
-  rename("Reported name"=Taxon,"Translated name from WORMS"=valid_name,"Valid AphiaID"=valid_AphiaID,"Valid class"=class) %>%
-  kable(digits = 3, row.names = FALSE, align = "c", caption = NULL)
-
+worms_all <- worms_all %>%
+  coalesce_join(missing_id_fuzzy2, by = "name2worms", na_matches = "never") %>%
+  mutate(fuzzy = coalesce(fuzzy, fuzzy2)) %>%
+  mutate(scientificname = ifelse(is.na(fuzzy), scientificname, fuzzy))
 ```
 
-## Merge class data table with the fuzzy table
+## Match genus name
 
-Writes a list of all matched classes in WORMS_classification_results.csv.
+Continue by matching the genus name of the remaining missing species with WoRMS, to get class information
+
+```{r matchgenus, echo = FALSE, warning = FALSE}
+missing_id3 <- worms_all %>%
+  filter(is.na(class))
+
+missing_id3$scientificname <- word(missing_id3$SPECI_name, 1) # Select first word in species name
+
+missing_id_fuzzy3 <- data.frame()
+
+start_time = Sys.time()
+for (i in 1:length(missing_id3$scientificname)) {
+    tryCatch({
+        missing_list3 <- wm_records_name(name=missing_id3$scientificname[i], fuzzy=TRUE, marine_only=FALSE)
+        missing_list3$name2worms <- missing_id3$scientificname[i]
+        missing3 <- missing_list3[1,]
+        for (i in 1:length(missing_list3$scientificname)) {
+          if(is.na(missing3$scientificname)) {
+            missing3 <- missing_list3[i+1,]
+          }
+        }
+        missing_id_fuzzy3 <- rbind(missing_id_fuzzy3, missing3)
+    }, error=function(e){})
+}
+end_time = Sys.time()
+end_time - start_time
+
+genus_all <- missing_id3 %>%
+  select("SPECI_name","scientificname") %>%
+  left_join(missing_id_fuzzy3, by = "scientificname", na_matches = "never") %>%
+  filter(!is.na(AphiaID)) %>%
+  rename("fuzzy3" = name2worms) %>%
+  distinct()
+
+genus_all$worms_name <- genus_all$scientificname
+
+print(paste(length(genus_all$SPECI_name), "additional taxa were matched by genus name", sep=" "))
+```
+
+## Summary of all matched taxa
+
+Write a list of all WoRMS results in WoRMS_classification_results.txt
 
 ```{r lookup, echo = FALSE}
-lookup_all <- lookup %>% 
-  left_join(missing_id_fuzzy, by = "Taxon") %>% 
-  mutate(class = coalesce(class.x, class.y)) %>% 
-  select(Taxon,class)
-colnames(lookup_all) <- c("SPECI_name","PEG_class")
-lookup_all <- lookup_all[!duplicated(lookup_all), ] # Removes potential duplicates
+worms_all <- worms_all %>%
+  coalesce_join(genus_all, by = "SPECI_name",  na_matches = "never") %>%
+  mutate(scientificname = ifelse(is.na(worms_name), scientificname, worms_name)) %>%
+  mutate(name2worms = ifelse(is.na(fuzzy3), name2worms, fuzzy3)) %>%
+  mutate(scientificname = ifelse(is.na(AphiaID), NA, scientificname)) %>%
+  select(-fuzzy, -fuzzy2, -fuzzy3, -worms_name) %>%
+  relocate(SPECI_name, name2worms) %>% 
+  distinct()
 
-write.csv(lookup_all, "WORMS_classification_results.csv")
+classes <- worms_all %>%
+  select(SPECI_name,class) %>%
+  rename("PEG_class" = class)
+
+classes %>%
+  rename("Reported name" = SPECI_name,
+         "WoRMS class" = PEG_class) %>%
+  kable %>%
+  kable_styling("striped", full_width = F) %>% 
+  row_spec(which(is.na(classes$PEG_class)), color = "red") %>%
+  scroll_box(width = "1000px", height = "1000px")
+
+write.table(worms_all,"WoRMS_classification_results.txt", sep = "\t", row.names = F)
 ```
 
-## Merge lookup table with ICES export table
+## Summary of taxa that could not be classified by the script
+
+Misspelled taxa names may be corrected in the input data file, if needed
+
+```{r noclass, echo = FALSE}
+print(paste(length(classes$PEG_class[is.na(classes$PEG_class)]), "taxa could not be assigned a class", sep=" "))
+
+classes %>%
+  filter(is.na(PEG_class)) %>%
+  rename("Reported name"=SPECI_name,
+         "WoRMS class"=PEG_class) %>%
+  kable %>%
+  kable_styling("striped", full_width = F) %>% 
+  scroll_box(width = "1000px", height = "1000px")
+```
+
+## Join lookup table with ICES export table
 
 ```{r merge, echo = FALSE}
 data <- data %>% 
-  left_join(unique(lookup_all), data, by = "SPECI_name",na_matches = "na") %>% 
+  left_join(classes, data, by = "SPECI_name", na_matches = "never") %>% 
   mutate(PEG_class = PEG_class.y)
 ```
 
@@ -191,6 +361,8 @@ data <- data %>%
 data <- filter(data, PEG_class %in% c("Bacillariophyceae","Cyanophyceae")  | 
                      SPECI_name %in% "Mesodinium rubrum" | 
                      PEG_class %in% "Dinophyceae" & PEG_TRPHY %in% c("AU","MX"))
+
+print(paste("Dataset has", paste(length(data$final_value)), "datapoints with the selected taxa,", paste(params$biomass) ,"data will be aggregated for each sample", sep=" "))
 ```
 
 ## Aggregate biomass data for each sample, class and date
@@ -198,7 +370,7 @@ data <- filter(data, PEG_class %in% c("Bacillariophyceae","Cyanophyceae")  |
 Groups are renamed to names of choice (e.g. Diatoms, Dinoflagellates) and the data table is converted to be compatible with the Helcom candidate indicator script.
 
 ```{r aggregate, echo = FALSE}
-data_all <- aggregate(final_value ~ ï..tblSampleID+Country+RLABO+STATN+PEG_class+DATE+Year+Month, data, sum, na.action = na.omit)
+data_all <- aggregate(final_value ~ ï..tblSampleID + Country + RLABO + STATN + PEG_class + DATE + Year + Month, data, sum, na.action = na.omit)
 
 data_all <- data_all %>% 
   mutate_all(str_replace_all, "Bacillariophyceae", "Diatoms") %>% 
@@ -207,11 +379,12 @@ data_all <- data_all %>%
   mutate_all(str_replace_all, "Litostomatea", "Mesodinium_rubrum")
 
 colnames(data_all) <- c("sampleid","country","rlabo","station","taxa","date","year","month","biomass")
+
 data_all <- data_all %>% 
   mutate_at(vars(biomass, year, month), ~as.numeric(as.character(.))) 
 ```
 
-## Plot biomass time series data for each taxonomic group, for selecting test and reference years
+## Plot biomass time series data for each taxonomic group, for selecting relevant test and reference years
 
 ```{r plottaxa, echo = FALSE}
 for (i in 1:length(unique(data_all$taxa))) {
@@ -236,13 +409,18 @@ dev.off()
 
 ## Save file to output
 
-data_all.csv can be imported in the Helcom candidate indicator script. The first 50 rows are printed below.
+data_all.csv can be imported in the Helcom candidate indicator script. The full list is also printed below.
 
-```{r savefiles}
+```{r savefiles, echo = FALSE}
 data_all <- data_all %>% arrange(year, month)
 write.table(data_all,"data_all.csv",sep=';', dec=',')
 
-kable(data_all[1:50,],digits = 3, row.names = FALSE, align = "c", caption = NULL)
+data_all$biomass <- as.character(data_all$biomass)
+
+data_all %>%
+  kable(digits = 3) %>%
+  kable_styling("striped", full_width = F) %>% 
+  scroll_box(width = "1000px", height = "1000px")
 ```
 
 ## Reproducibility
